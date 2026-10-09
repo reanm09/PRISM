@@ -1,4 +1,4 @@
-const API_BASE = (process.env.NEXT_PUBLIC_PRISM_API_URL ?? 'http://localhost:8000').replace(/\/$/, '');
+const API_BASE = (process.env.NEXT_PUBLIC_PRISM_API_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '');
 
 export class PrismApiError extends Error {
   status: number;
@@ -76,4 +76,44 @@ export function buildGraph(artifactId: string) {
 
 export function getHealth() {
   return prismFetch<{ status: string; service: string }>('/health');
+}
+
+export function getLocalStatus() {
+  return prismFetch<Record<'backend' | 'ollama' | 'laya' | 'rag' | 'lab', string>>('/api/local/status');
+}
+
+export function analyzeArtifact(artifactId: string) {
+  return prismFetch<import('./types').PrismAnalysis>(`/api/artifacts/${artifactId}/analyze`, { method: 'POST' });
+}
+
+export function reasonArtifact(artifactId: string) {
+  return prismFetch<import('./types').SemanticReasoningResult>(`/api/artifacts/${artifactId}/reason`, { method: 'POST' });
+}
+
+export function investigateArtifact(artifactId: string) {
+  return prismFetch<import('./types').AutonomousInvestigationResult>(`/api/artifacts/${artifactId}/investigate`, { method: 'POST' });
+}
+
+export function getSentinelStatus() {
+  return prismFetch<import('./types').SentinelStatus>('/api/sentinel/status');
+}
+
+export function getSentinelWatchRoots() {
+  return prismFetch<import('./types').SentinelWatchRoot[]>('/api/sentinel/watch-roots');
+}
+
+export function getRecentSentinelEvents() {
+  return prismFetch<import('./types').SentinelEvent[]>('/api/sentinel/events/recent');
+}
+
+export function sentinelEventsUrl() {
+  return `${API_BASE}/api/sentinel/events`;
+}
+
+export function getArtifactQuarantine(artifactId: string) {
+  return prismFetch<import('./types').QuarantineRecord>(`/api/quarantine/artifact/${artifactId}`);
+}
+
+export function restoreQuarantine(quarantineId: string) {
+  return prismFetch<import('./types').QuarantineRecord>(`/api/quarantine/${quarantineId}/restore`, { method: 'POST' });
 }

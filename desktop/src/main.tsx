@@ -11,12 +11,12 @@ import {
 import './styles.css';
 import prismLogo from './assets/prism-logo.png';
 import {
-  addWatch, clearHistory, getHealth, getHistory, getImmuneMemory, getQuarantine, getRemoteArtifact,
+  addWatch, clearHistory, getHealth, getHistory, getImmuneMemory, getQuarantine, getBackendQuarantine, getSentinelStatus, getSentinelWatchRoots, getSentinelEvents, getRemoteArtifact,
   getRemoteFastScan, getRemoteFractures, getRemoteGraph, getRemoteInterpretation, getRemoteInvestigation,
   getRemotePassport, getSettings, getWatches, handoffArtifact, openQuarantineFolder, pickFile, pickFolder,
-  backendRequest, quarantineFile, removeWatch, restoreQuarantine, revealFile, runRemoteFastScan, runRemoteGraph,
-  runRemoteInterpret, scanDirectory, scanFile, scanWatchedFolder, setApiUrl, startRemoteLab,
-  type BatchScanResult, type HistoryItem, type JsonValue, type QuarantineItem, type ScanResult
+  backendRequest, removeWatch, restoreQuarantine, restoreBackendQuarantine, revealFile, runRemoteAnalyze, runRemoteReason, runRemoteInvestigation, runRemoteFastScan, runRemoteGraph,
+  runRemoteInterpret, scanDirectory, scanFile, scanWatchedFolder, setApiUrl,
+  type BackendQuarantineItem, type BatchScanResult, type HistoryItem, type JsonValue, type QuarantineItem, type ScanResult
 } from './lib/api';
 
 type View =
@@ -77,6 +77,11 @@ function App() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [watches, setWatches] = useState<string[]>([]);
   const [quarantine, setQuarantine] = useState<QuarantineItem[]>([]);
+  const [backendQuarantine, setBackendQuarantine] = useState<BackendQuarantineItem[]>([]);
+  const [selectedBackendQ, setSelectedBackendQ] = useState<BackendQuarantineItem | null>(null);
+  const [sentinelState, setSentinelState] = useState<JsonValue | null>(null);
+  const [sentinelRoots, setSentinelRoots] = useState<JsonValue[]>([]);
+  const [sentinelEvents, setSentinelEvents] = useState<JsonValue[]>([]);
   const [review, setReview] = useState<DetectedEvent[]>([]);
   const [selected, setSelected] = useState<ScanResult | null>(null);
   const [selectedQ, setSelectedQ] = useState<QuarantineItem | null>(null);
@@ -101,9 +106,24 @@ function App() {
     catch { setApiConnected(false); return false; }
   };
 
+  const refreshBackend = async (url = apiUrl) => {
+    try {
+      const [q, status, roots, events] = await Promise.all([
+        getBackendQuarantine(url), getSentinelStatus(url), getSentinelWatchRoots(url), getSentinelEvents(url),
+      ]);
+      setBackendQuarantine(q);
+      setSelectedBackendQ(current => q.find(item => item.quarantine_id === current?.quarantine_id) ?? null);
+      setSentinelState(status);
+      setSentinelRoots(Array.isArray(roots) ? roots : []);
+      setSentinelEvents(Array.isArray(events) ? events : []);
+      setApiConnected(true);
+    } catch { setApiConnected(false); }
+  };
+
   useEffect(() => {
     refresh().catch(() => setStatusMessage('Sentinel started, but local state could not be fully loaded.'));
     checkBackend();
+    void refreshBackend();
     let a: (() => void) | undefined;
     let b: (() => void) | undefined;
     Promise.all([
@@ -117,12 +137,17 @@ function App() {
     return () => { a?.(); b?.(); };
   }, []);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => { void refreshBackend(); }, 5000);
+    return () => window.clearInterval(timer);
+  }, [apiUrl]);
+
   const stats = useMemo(() => ({
     scanned: history.length,
     review: review.length + history.filter(x => x.status === 'REVIEW').length,
     clear: history.filter(x => x.status === 'CLEAR').length,
-    quarantined: quarantine.length,
-  }), [history, review, quarantine]);
+    quarantined: backendQuarantine.filter(x => x.status === 'QUARANTINED').length + quarantine.length,
+  }), [history, review, quarantine, backendQuarantine]);
 
   const selectScan = (result: ScanResult) => { setSelected(result); setSelectedQ(null); setView('scan'); };
 
@@ -163,16 +188,20 @@ function App() {
   };
 
   const doQuarantine = async () => {
-    if (!selected) return;
-    setBusy(true);
-    try { const item = await quarantineFile(selected.path); setSelectedQ(item); await refresh(); setSelected({ ...selected, status: 'QUARANTINED' }); setStatusMessage(`${item.name} is quarantined · inspect the evidence before restoring.`); setView('quarantine'); }
-    catch (e) { setStatusMessage(`Quarantine failed · ${String(e)}`); }
-    finally { setBusy(false); }
+    setStatusMessage('Encrypted containment is performed by PRISM Sentinel for explicitly watched folders. Configure a watch root with prism watch add.');
+    setView('watch');
   };
 
   const doRestore = async (item: QuarantineItem) => {
     setBusy(true);
     try { const path = await restoreQuarantine(item.id); await refresh(); setSelectedQ(null); setStatusMessage(`Restored · ${path}`); setView('history'); }
+    catch (e) { setStatusMessage(`Restore failed · ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  const doRestoreBackend = async (item: BackendQuarantineItem) => {
+    setBusy(true);
+    try { await restoreBackendQuarantine(apiUrl, item.quarantine_id); await refreshBackend(); setStatusMessage(`Authenticated restore completed · ${item.original_name}`); }
     catch (e) { setStatusMessage(`Restore failed · ${String(e)}`); }
     finally { setBusy(false); }
   };
@@ -184,9 +213,11 @@ function App() {
       const out = await handoffArtifact(selected.path, apiUrl);
       setRemoteId(out.artifact_id);
       setApiConnected(true);
-      await loadRemote('artifact', out.artifact_id);
-      setStatusMessage(`Artifact connected to PRISM · ${out.artifact_id}`);
-    } catch (e) { setStatusMessage(`Backend handoff failed · ${String(e)}`); setApiConnected(false); }
+      const analysis = await runRemoteAnalyze(apiUrl, out.artifact_id);
+      setRemotePane({ title: 'analysis', body: analysis });
+      setRemoteArtifact({ title: 'artifact', body: await getRemoteArtifact(apiUrl, out.artifact_id) });
+      setStatusMessage(`Artifact analyzed by PRISM · ${out.artifact_id}`);
+    } catch (e) { setStatusMessage(`Backend handoff or analysis failed · ${String(e)}`); }
     finally { setBusy(false); }
   };
 
@@ -201,7 +232,7 @@ function App() {
       else if (kind === 'interpretation') body = await getRemoteInterpretation(apiUrl, id);
       else if (kind === 'graph') body = await getRemoteGraph(apiUrl, id);
       else if (kind === 'fractures') body = await getRemoteFractures(apiUrl, id);
-      else if (kind === 'lab') body = await startRemoteLab(apiUrl, id);
+      else if (kind === 'lab') body = await getRemoteInvestigation(apiUrl, id);
       else if (kind === 'investigation') body = await getRemoteInvestigation(apiUrl, id);
       else if (kind === 'passport') body = await getRemotePassport(apiUrl, id);
       else body = await backendRequest(apiUrl, `/api/artifacts/${encodeURIComponent(id)}/${kind}`);
@@ -211,15 +242,23 @@ function App() {
     finally { setBusy(false); }
   };
 
-  const runBackendStep = async (step: 'fastscan' | 'interpret' | 'graph' | 'lab') => {
+  const runBackendStep = async (step: 'analyze' | 'fastscan' | 'interpret' | 'graph' | 'lab') => {
     if (!remoteId) { setStatusMessage('Connect an artifact before starting backend analysis.'); return; }
     setBusy(true);
     try {
+      if (step === 'analyze') setRemotePane({ title: 'analysis', body: await runRemoteAnalyze(apiUrl, remoteId) });
       if (step === 'fastscan') await runRemoteFastScan(apiUrl, remoteId);
       if (step === 'interpret') await runRemoteInterpret(apiUrl, remoteId);
-      if (step === 'graph') await runRemoteGraph(apiUrl, remoteId);
-      if (step === 'lab') await startRemoteLab(apiUrl, remoteId);
-      await loadRemote(step === 'lab' ? 'lab' : step === 'interpret' ? 'interpretation' : step);
+      if (step === 'graph') {
+        try { await getRemoteGraph(apiUrl, remoteId); }
+        catch (error) {
+          if (!String(error).includes('DEEP_INTERPRETATION_NOT_PERFORMED')) throw error;
+          await runRemoteInterpret(apiUrl, remoteId);
+          await runRemoteGraph(apiUrl, remoteId);
+        }
+      }
+      if (step === 'lab') { await runRemoteReason(apiUrl, remoteId); const result = await runRemoteInvestigation(apiUrl, remoteId); setRemotePane({ title: 'investigation', body: result }); }
+      if (step !== 'lab' && step !== 'analyze') await loadRemote(step === 'interpret' ? 'interpretation' : step);
       setStatusMessage(`Backend operation completed · ${step}`);
     } catch (e) {
       setStatusMessage(`Backend operation failed · ${String(e)}`);
@@ -250,10 +289,13 @@ function App() {
   };
 
   const saveApi = async (value: string) => {
-    await setApiUrl(value);
-    setApiUrlState(value);
-    const ok = await checkBackend(value);
-    setStatusMessage(ok ? 'PRISM backend connected.' : 'Endpoint saved. Backend is not reachable from this client.');
+    try {
+      await setApiUrl(value);
+      setApiUrlState(value);
+      const ok = await checkBackend(value);
+      if (ok) await refreshBackend(value);
+      setStatusMessage(ok ? 'PRISM backend connected.' : 'Endpoint saved. Backend is not reachable from this client.');
+    } catch (error) { setStatusMessage(`Endpoint rejected · ${String(error)}`); }
   };
 
   return <div className="app-shell">
@@ -269,17 +311,17 @@ function App() {
       <div className="statusbar"><Activity size={14}/><span>{statusMessage}</span>{busy&&<span className="busy-pill">WORKING</span>}</div>
 
       <section className="content">
-        {view==='overview'&&<Overview stats={stats} watches={watches} history={history} quarantine={quarantine} remoteId={remoteId} onScan={runSingleScan} onFolder={runFolderScan} onReview={()=>setView('review')} onWatch={()=>setView('watch')} onQuarantine={()=>setView('quarantine')} onLab={()=>remoteId?handleBackendView('lab'):sendToLab()}/>} 
+        {view==='overview'&&<Overview stats={stats} watches={watches} history={history} quarantine={backendQuarantine} remoteId={remoteId} onScan={runSingleScan} onFolder={runFolderScan} onReview={()=>setView('review')} onWatch={()=>setView('watch')} onQuarantine={()=>setView('quarantine')} onLab={()=>remoteId?handleBackendView('lab'):sendToLab()}/>} 
         {view==='intercept'&&<InterceptView review={review} watches={watches} onReview={reviewArtifact} onWatch={()=>setView('watch')} />}
         {view==='artifacts'&&<BackendArtifactView body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} selected={selected} onUpload={sendToLab} onRefresh={()=>loadRemote('artifact')} onFastScan={()=>runBackendStep('fastscan')} onInterpret={()=>runBackendStep('interpret')} onGraph={()=>runBackendStep('graph')} onLab={()=>runBackendStep('lab')} /> }
         {view==='fractures'&&<BackendEvidenceView title="Semantic Fractures" subtitle="Security-relevant interpretation disagreements returned by the connected PRISM backend." body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onAction={()=>loadRemote('fractures')} actionLabel="Refresh" empty="Upload/select an artifact, then load its fracture evidence." />}
         {view==='review'&&<ReviewQueue items={review} history={history.filter(x=>x.status==='REVIEW')} onReview={reviewArtifact} />}
         {view==='scan'&&<ScanView selected={selected} batch={batch} onScan={runSingleScan} onFolder={runFolderScan} onQuarantine={doQuarantine} onLab={sendToLab} onReveal={()=>selected&&revealFile(selected.path)} onRisk={() => setStatusMessage(selected?.reason||'No additional local status message.')} />}
-        {view==='watch'&&<WatchView watches={watches} onAdd={addWatchLocation} onRemove={async p=>{await removeWatch(p);setWatches(await getWatches());setStatusMessage(`Monitoring removed · ${p}`)}} onScan={scanWatched} />}
-        {view==='quarantine'&&<QuarantineView items={quarantine} selected={selectedQ} onSelect={setSelectedQ} onRestore={doRestore} onOpenFolder={async()=>{const p=await openQuarantineFolder();setStatusMessage(`Quarantine folder · ${p}`)}} onReveal={revealFile} />}
+        {view==='watch'&&<><SentinelBackendPanel state={sentinelState} roots={sentinelRoots} events={sentinelEvents} connected={apiConnected}/><WatchView watches={watches} onAdd={addWatchLocation} onRemove={async p=>{await removeWatch(p);setWatches(await getWatches());setStatusMessage(`Monitoring removed · ${p}`)}} onScan={scanWatched} /></>}
+        {view==='quarantine'&&<><BackendQuarantineView items={backendQuarantine} selected={selectedBackendQ} onSelect={setSelectedBackendQ} onRestore={doRestoreBackend} connected={apiConnected}/>{quarantine.length>0&&<QuarantineView items={quarantine} selected={selectedQ} onSelect={setSelectedQ} onRestore={doRestore} onOpenFolder={async()=>{const p=await openQuarantineFolder();setStatusMessage(`Legacy local quarantine folder · ${p}`)}} onReveal={revealFile} />}</>}
         {view==='history'&&<HistoryView history={history} onSelect={selectScan} onClear={async()=>{await clearHistory();await refresh();setStatusMessage('Local history cleared.')}} />}
-        {view==='graph'&&<GraphView body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onRefresh={()=>loadRemote('graph')} />}
-        {view==='lab'&&<LabView body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onStart={()=>loadRemote('lab')} />}
+        {view==='graph'&&<GraphView body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onRefresh={()=>loadRemote('graph')} onGenerate={()=>runBackendStep('graph')} />}
+        {view==='lab'&&<LabView body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onStart={()=>runBackendStep('lab')} />}
         {view==='experiments'&&<ExperimentView body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onRefresh={()=>loadRemote('investigation')} />}
         {view==='evidence'&&<EvidenceView selected={selected} body={remotePane.body} error={remotePane.error} loading={remotePane.loading} remoteId={remoteId} onRefresh={()=>loadRemote('fastscan')} />}
         {view==='compare'&&<CompareView selected={selected} remoteId={remoteId} remoteArtifact={remoteArtifact.body??remotePane.body} onRefresh={()=>loadRemote('artifact')} />}
@@ -294,7 +336,7 @@ function App() {
   </div>;
 }
 
-function Overview({stats,watches,history,quarantine,remoteId,onScan,onFolder,onReview,onWatch,onQuarantine,onLab}:{stats:{scanned:number;review:number;clear:number;quarantined:number};watches:string[];history:HistoryItem[];quarantine:QuarantineItem[];remoteId:string|null;onScan:()=>void;onFolder:()=>void;onReview:()=>void;onWatch:()=>void;onQuarantine:()=>void;onLab:()=>void}){
+function Overview({stats,watches,history,quarantine,remoteId,onScan,onFolder,onReview,onWatch,onQuarantine,onLab}:{stats:{scanned:number;review:number;clear:number;quarantined:number};watches:string[];history:HistoryItem[];quarantine:BackendQuarantineItem[];remoteId:string|null;onScan:()=>void;onFolder:()=>void;onReview:()=>void;onWatch:()=>void;onQuarantine:()=>void;onLab:()=>void}){
   const latest=history[0];
   return <div className="page-stack">
     <div className="hero-grid"><div className="hero-copy"><div className="section-label">ENDPOINT + INVESTIGATION</div><h2>One PRISM client for the whole workflow.</h2><p>Sentinel can inspect local artifacts, monitor directories, quarantine files, and hand the same evidence to the deeper PRISM interpretation and Lab stack.</p><div className="hero-actions"><button className="primary" onClick={onScan}><ScanLine size={16}/> Scan artifact</button><button className="secondary" onClick={onFolder}><FolderSearch2 size={16}/> Scan directory</button>{remoteId&&<button className="secondary" onClick={onLab}><BrainCircuit size={16}/> Open Lab</button>}</div></div><div className="hero-evidence"><div className="section-label">LOCAL STATE</div><div className="metric-list"><Metric label="Artifacts scanned" value={stats.scanned}/><Metric label="Review queue" value={stats.review}/><Metric label="Watched locations" value={watches.length}/><Metric label="Quarantined" value={stats.quarantined}/></div></div></div>
@@ -308,7 +350,7 @@ function PanelTitle({label,title}:{label:string;title:string}){return <div class
 
 function InterceptView({review,watches,onReview,onWatch}:{review:DetectedEvent[];watches:string[];onReview:(i:DetectedEvent)=>void;onWatch:()=>void}){return <div className="page-stack"><div className="hero-grid compact"><div className="hero-copy"><div className="section-label">LOCAL INTERCEPTION SURFACE</div><h2>Observed files are routed through Sentinel.</h2><p>The current endpoint implementation watches selected directories. Created or modified files are re-inspected, and elevated evidence can enter Review Queue.</p><button className="secondary" onClick={onWatch}><Radio size={16}/> Configure watch locations</button></div><div className="hero-evidence"><div className="section-label">ACTIVE SCOPE</div><div className="metric-list"><Metric label="Watched locations" value={watches.length}/><Metric label="Pending review events" value={review.length}/></div></div></div><div className="panel"><PanelTitle label="INTERCEPTED ARTIFACTS" title="Review events"/>{review.length===0?<Empty icon={Radar} title="No pending interception events" body="New or modified files from watched folders appear here when local evidence requires review."/>:<div className="event-list">{review.map(item=><div className="event-row" key={item.path}><div className="event-icon"><Radar size={16}/></div><div><strong>{item.name}</strong><span>{item.path}</span><small>{item.reason||'Local evidence requires inspection'} · {item.risk_score??'—'}/100</small></div><button className="secondary small" onClick={()=>onReview(item)}>Inspect</button></div>)}</div>}</div></div>}
 
-function ScanView({selected,batch,onScan,onFolder,onQuarantine,onLab,onReveal,onRisk}:{selected:ScanResult|null;batch:BatchScanResult|null;onScan:()=>void;onFolder:()=>void;onQuarantine:()=>void;onLab:()=>void;onReveal:()=>void;onRisk:()=>void}){return <div className="page-stack"><div className="action-banner"><div><div className="section-label">LOCAL FASTSCAN</div><h3>Inspect real bytes before deeper analysis.</h3><p>Claims come from the filename/extension; observed identity comes from the bytes Sentinel actually read.</p></div><div className="hero-actions"><button className="secondary" onClick={onFolder}><FolderSearch2 size={16}/> Scan directory</button><button className="primary" onClick={onScan}><ScanLine size={16}/> Scan file</button></div></div>{batch&&<div className="stat-row"><StatCard label="Scanned" value={batch.scanned} icon={ScanLine}/><StatCard label="Review" value={batch.review} icon={CircleAlert}/><StatCard label="Clear" value={batch.clear} icon={CheckCircle2}/><StatCard label="Failed" value={batch.failed} icon={ShieldQuestion}/></div>}{selected?<div className="scan-grid"><div className="panel"><div className="scan-header"><div><div className="section-label">SELECTED ARTIFACT</div><h2>{selected.name}</h2><p>{selected.path}</p></div><RiskScore score={selected.risk_score}/></div><div className="evidence-grid"><Evidence label="Claimed type" value={selected.declared_type}/><Evidence label="Observed type" value={selected.detected_type}/><Evidence label="Size" value={formatBytes(selected.size_bytes)}/><Evidence label="Entropy" value={`${selected.entropy.toFixed(2)} / 8.00`}/><Evidence label="SHA-256" value={selected.sha256} mono/><Evidence label="Status" value={selected.status}/></div></div><div className="panel"><PanelTitle label="LOCAL EVIDENCE" title="Risk factors"/>{selected.risk_factors.map((x,i)=><div className="marker" key={x+i}><CircleAlert size={14}/>{x}</div>)}<div className="action-stack"><button className="secondary" onClick={onRisk}><SlidersHorizontal size={15}/> Show decision rationale</button><button className="secondary" onClick={onReveal}><FolderOpen size={15}/> Reveal local file</button>{selected.status!=='QUARANTINED'&&<button className="danger" onClick={onQuarantine}><ArchiveRestore size={15}/> Quarantine</button>}<button className="primary" onClick={onLab}><UploadCloud size={15}/> Connect to PRISM backend</button></div></div></div>:<Empty icon={ScanLine} title="No artifact selected" body="Select a local file or directory to begin." action={onScan} actionLabel="Scan a file"/>}</div>}
+function ScanView({selected,batch,onScan,onFolder,onQuarantine,onLab,onReveal,onRisk}:{selected:ScanResult|null;batch:BatchScanResult|null;onScan:()=>void;onFolder:()=>void;onQuarantine:()=>void;onLab:()=>void;onReveal:()=>void;onRisk:()=>void}){return <div className="page-stack"><div className="action-banner"><div><div className="section-label">LOCAL FASTSCAN</div><h3>Inspect real bytes before deeper analysis.</h3><p>Claims come from the filename/extension; observed identity comes from the bytes Sentinel actually read.</p></div><div className="hero-actions"><button className="secondary" onClick={onFolder}><FolderSearch2 size={16}/> Scan directory</button><button className="primary" onClick={onScan}><ScanLine size={16}/> Scan file</button></div></div>{batch&&<div className="stat-row"><StatCard label="Scanned" value={batch.scanned} icon={ScanLine}/><StatCard label="Review" value={batch.review} icon={CircleAlert}/><StatCard label="Clear" value={batch.clear} icon={CheckCircle2}/><StatCard label="Failed" value={batch.failed} icon={ShieldQuestion}/></div>}{selected?<div className="scan-grid"><div className="panel"><div className="scan-header"><div><div className="section-label">SELECTED ARTIFACT</div><h2>{selected.name}</h2><p>{selected.path}</p></div><RiskScore score={selected.risk_score}/></div><div className="evidence-grid"><Evidence label="Claimed type" value={selected.declared_type}/><Evidence label="Observed type" value={selected.detected_type}/><Evidence label="Size" value={formatBytes(selected.size_bytes)}/><Evidence label="Entropy" value={`${selected.entropy.toFixed(2)} / 8.00`}/><Evidence label="SHA-256" value={selected.sha256} mono/><Evidence label="Status" value={selected.status}/></div></div><div className="panel"><PanelTitle label="LOCAL EVIDENCE" title="Risk factors"/>{selected.risk_factors.map((x,i)=><div className="marker" key={x+i}><CircleAlert size={14}/>{x}</div>)}<div className="action-stack"><button className="secondary" onClick={onRisk}><SlidersHorizontal size={15}/> Show decision rationale</button><button className="secondary" onClick={onReveal}><FolderOpen size={15}/> Reveal local file</button>{selected.status!=='QUARANTINED'&&<button className="danger" onClick={onQuarantine}><ArchiveRestore size={15}/> Configure encrypted Sentinel containment</button>}<button className="primary" onClick={onLab}><UploadCloud size={15}/> Connect to PRISM backend</button></div></div></div>:<Empty icon={ScanLine} title="No artifact selected" body="Select a local file or directory to begin." action={onScan} actionLabel="Scan a file"/>}</div>}
 function RiskScore({score}:{score:number}){return <div className={`score-box ${riskLabel(score).toLowerCase()}`}><span>RISK SCORE</span><strong>{score}</strong><em>{riskLabel(score)}</em></div>}
 function Evidence({label,value,mono}:{label:string;value:string;mono?:boolean}){return <div className="evidence"><span>{label}</span><strong className={mono?'mono':''}>{value}</strong></div>}
 
@@ -318,11 +360,22 @@ function WatchView({watches,onAdd,onRemove,onScan}:{watches:string[];onAdd:()=>v
 
 function HistoryView({history,onSelect,onClear}:{history:HistoryItem[];onSelect:(x:ScanResult)=>void;onClear:()=>void}){return <div className="page-stack"><div className="section-heading inline"><div><div className="section-label">LOCAL EVIDENCE LOG</div><h3>Completed scans</h3></div>{history.length>0&&<button className="danger small" onClick={onClear}><Trash2 size={14}/> Clear history</button>}</div><div className="panel">{history.length===0?<Empty icon={History} title="No history yet" body="Completed local scans appear here."/>:history.map(item=><button className="history-row" key={item.sha256} onClick={()=>onSelect(item)}><div className={`history-state ${item.status.toLowerCase()}`}>{item.status}</div><div><strong>{item.name}</strong><span>{item.path}</span></div><div className={`risk-mini ${riskLabel(item.risk_score).toLowerCase()}`}>{item.risk_score}/100</div><time>{timeAgo(item.scanned_at)}</time><ChevronRight size={15}/></button>)}</div></div>}
 
-function QuarantineView({items,selected,onSelect,onRestore,onOpenFolder,onReveal}:{items:QuarantineItem[];selected:QuarantineItem|null;onSelect:(x:QuarantineItem)=>void;onRestore:(x:QuarantineItem)=>void;onOpenFolder:()=>void;onReveal:(p:string)=>void}){return <div className="page-stack"><div className="section-heading inline"><div><div className="section-label">ISOLATED ARTIFACTS</div><h3>Quarantine</h3></div><button className="secondary" onClick={onOpenFolder}><ArchiveRestore size={16}/> Open quarantine folder</button></div><div className="quarantine-layout"><div className="panel">{items.length===0?<Empty icon={ArchiveRestore} title="Quarantine is empty" body="Artifacts appear here only after explicit local quarantine."/>:items.map(item=><button key={item.id} className={`quarantine-row ${selected?.id===item.id?'selected':''}`} onClick={()=>onSelect(item)}><div className={`risk-dot ${riskLabel(item.risk_score).toLowerCase()}`}>{item.risk_score}</div><div><strong>{item.name}</strong><span>{item.detected_type} · {formatBytes(item.size_bytes)}</span></div><ChevronRight size={15}/></button>)}</div>{selected?<div className="panel quarantine-detail"><div className="detail-header"><div><div className="section-label">QUARANTINED ARTIFACT</div><h2>{selected.name}</h2></div><RiskScore score={selected.risk_score}/></div><div className="detail-path"><span>Original location</span><code>{selected.original_path}</code></div><div className="detail-path"><span>Isolated location</span><code>{selected.quarantined_path}</code></div><div className="evidence-grid"><Evidence label="Claimed type" value={selected.declared_type}/><Evidence label="Observed type" value={selected.detected_type}/><Evidence label="SHA-256" value={selected.sha256} mono/></div><PanelTitle label="WHY IT WAS QUARANTINED" title="Evidence recorded at isolation"/>{selected.risk_factors.map((x,i)=><div className="marker" key={x+i}><CircleAlert size={14}/>{x}</div>)}<div className="quarantine-actions"><button className="secondary" onClick={()=>onReveal(selected.quarantined_path)}><FolderOpen size={15}/> Reveal isolated file</button><button className="primary" onClick={()=>onRestore(selected)}><RotateCcw size={15}/> Unquarantine / restore</button></div><div className="note">Restore returns the bytes to their original directory when possible. An occupied filename gets a non-destructive restored name.</div></div>:<div className="panel empty-detail"><ArchiveRestore size={28}/><h3>Select an isolated artifact</h3><p>Inspect its score, SHA-256, paths, and the actual evidence that led to the quarantine action.</p></div>}</div></div>}
+function SentinelBackendPanel({state,roots,events,connected}:{state:JsonValue|null;roots:JsonValue[];events:JsonValue[];connected:boolean}) {
+  const status = state !== null && isObject(state) ? state : null;
+  return <div className="panel"><PanelTitle label="PRISM BACKEND SENTINEL" title={connected ? 'Live watched-folder evidence' : 'Backend unavailable'}/><p>Backend watch roots are configured with <code>prism watch add</code>. Native desktop watches below are separate local review hints and do not trigger encrypted containment.</p><div className="metric-list"><Metric label="Configured backend folders" value={typeof status?.watch_root_count === 'number' ? status.watch_root_count : 0}/></div>{roots.map((root,i) => isObject(root) ? <div className="watch-row" key={i}><strong>{String(root.display_name ?? 'Watch root')}</strong><span>{root.recursive ? 'Recursive' : 'This folder only'}</span></div> : null)}<div className="section-label">RECENT BACKEND EVENTS</div>{events.slice(0,8).map((event,i) => isObject(event) ? <div className="event-row" key={String(event.event_id ?? i)}><strong>{String(event.event_type ?? 'Event')}</strong><span>{String(event.file_name ?? 'Sentinel')} · {String(event.message ?? '')}</span>{event.containment_trigger ? <small>Containment: {String(event.containment_trigger)} · Deterministic: {String(event.verified_state ?? 'No deterministic verified state')}</small> : null}</div> : null)}</div>;
+}
+
+function BackendQuarantineView({items,selected,onSelect,onRestore,connected}:{items:BackendQuarantineItem[];selected:BackendQuarantineItem|null;onSelect:(x:BackendQuarantineItem)=>void;onRestore:(x:BackendQuarantineItem)=>void;connected:boolean}) {
+  return <div className="page-stack"><div className="section-heading inline"><div><div className="section-label">AUTHENTICATED PRISM CONTAINMENT</div><h3>Encrypted quarantine</h3></div></div><div className="quarantine-layout"><div className="panel">{!connected?<Empty icon={Unplug} title="Backend unavailable" body="Connect to the local PRISM backend to view encrypted quarantine records."/>:items.length===0?<Empty icon={ArchiveRestore} title="No backend quarantine records" body="Only real Sentinel containment events appear here."/>:items.map(item=><button key={item.quarantine_id} className={`quarantine-row ${selected?.quarantine_id===item.quarantine_id?'selected':''}`} onClick={()=>onSelect(item)}><div className="risk-dot elevated"><LockKeyhole size={15}/></div><div><strong>{item.original_name}</strong><span>{item.status} · {item.trigger}</span></div><ChevronRight size={15}/></button>)}</div>{selected?<div className="panel quarantine-detail"><div className="detail-header"><div><div className="section-label">{selected.status}</div><h2>{selected.original_name}</h2></div></div><div className="evidence-grid"><Evidence label="Containment trigger" value={selected.trigger}/><Evidence label="Laya prediction (advisory)" value={selected.laya_prediction ?? '—'}/><Evidence label="Model confidence" value={selected.laya_confidence === null ? '—' : `${Math.round(selected.laya_confidence*100)}%`}/><Evidence label="Deterministic verified state" value={selected.verified_state ?? 'No deterministic verified state'}/><Evidence label="Encrypted container" value={selected.container_name}/><Evidence label="SHA-256" value={selected.sha256} mono/></div>{selected.reason_codes.length ? <div className="marker">Verified reasons: {selected.reason_codes.join(', ')}</div> : null}<p className="note">Laya-triggered containment is precautionary. It does not establish deterministic SUSPICIOUS.</p>{selected.status==='QUARANTINED' ? <button className="primary" onClick={()=>onRestore(selected)}><RotateCcw size={15}/> Authenticate and restore</button> : null}</div>:<div className="panel empty-detail"><LockKeyhole size={28}/><h3>Select a contained artifact</h3><p>Containment and verified state remain separate.</p></div>}</div></div>;
+}
+
+function QuarantineView({items,selected,onSelect,onRestore,onOpenFolder,onReveal}:{items:QuarantineItem[];selected:QuarantineItem|null;onSelect:(x:QuarantineItem)=>void;onRestore:(x:QuarantineItem)=>void;onOpenFolder:()=>void;onReveal:(path:string)=>void}) {
+  return <div className="page-stack"><div className="section-heading inline"><div><div className="section-label">LEGACY LOCAL RECORDS</div><h3>Previous desktop containment</h3></div><button className="secondary" onClick={onOpenFolder}>Open legacy folder</button></div><div className="callout neutral"><CircleAlert size={18}/><div><strong>Legacy records are not encrypted PRISM containers.</strong><span>They remain available here only for recovery. New containment uses backend Sentinel above.</span></div></div><div className="quarantine-layout"><div className="panel">{items.map(item=><button key={item.id} className={`quarantine-row ${selected?.id===item.id?'selected':''}`} onClick={()=>onSelect(item)}><strong>{item.name}</strong><span>Legacy local record</span></button>)}</div>{selected&&<div className="panel quarantine-detail"><h3>{selected.name}</h3><Evidence label="SHA-256" value={selected.sha256} mono/><div className="action-stack"><button className="secondary" onClick={()=>onReveal(selected.quarantined_path)}>Reveal legacy file</button><button className="primary" onClick={()=>onRestore(selected)}>Restore legacy file</button></div></div>}</div></div>;
+}
 
 function BackendArtifactView({body,error,loading,remoteId,selected,onUpload,onRefresh,onFastScan,onInterpret,onGraph,onLab}:{body:JsonValue|null;error?:string;loading?:boolean;remoteId:string|null;selected:ScanResult|null;onUpload:()=>void;onRefresh:()=>void;onFastScan:()=>void;onInterpret:()=>void;onGraph:()=>void;onLab:()=>void}){return <div className="page-stack"><div className="hero-grid compact"><div className="hero-copy"><div className="section-label">BACKEND ARTIFACT RECORD</div><h2>{remoteId?`Artifact ${remoteId}`:'Connect a local artifact to PRISM'}</h2><p>Use the native client to upload an inspected local artifact. Once connected, the desktop can drive the same FastScan, interpretation, graph and Lab stages used by the PRISM investigation stack.</p><div className="hero-actions"><button className="primary" onClick={onUpload} disabled={!selected}><CloudUpload size={16}/> Connect selected artifact</button><button className="secondary" onClick={onRefresh} disabled={!remoteId}><RefreshCw size={16}/> Refresh record</button></div></div><div className="hero-evidence"><div className="section-label">ANALYSIS STAGES</div><div className="stage-buttons"><button disabled={!remoteId} onClick={onFastScan}><ScanLine size={14}/> FastScan</button><button disabled={!remoteId} onClick={onInterpret}><FileSearch size={14}/> Interpret</button><button disabled={!remoteId} onClick={onGraph}><Network size={14}/> Build graph</button><button disabled={!remoteId} onClick={onLab}><BrainCircuit size={14}/> PRISM Lab</button></div></div></div><JsonPanel body={body} error={error} loading={loading} empty="No backend artifact is loaded yet." /></div>}
 
-function GraphView({body,error,loading,remoteId,onRefresh}:{body:JsonValue|null;error?:string;loading?:boolean;remoteId:string|null;onRefresh:()=>void}){return <div className="page-stack"><div className="action-banner"><div><div className="section-label">INTERPRETATION GRAPH</div><h3>Identities, structures, capabilities, parser observations.</h3><p>The graph is sourced from the connected PRISM backend. Nodes are rendered only when returned by the backend.</p></div><button className="secondary" disabled={!remoteId} onClick={onRefresh}><RefreshCw size={15}/> Refresh graph</button></div><JsonGraph body={body} error={error} loading={loading} /></div>}
+function GraphView({body,error,loading,remoteId,onRefresh,onGenerate}:{body:JsonValue|null;error?:string;loading?:boolean;remoteId:string|null;onRefresh:()=>void;onGenerate:()=>void}){return <div className="page-stack"><div className="action-banner"><div><div className="section-label">INTERPRETATION GRAPH</div><h3>Identities, structures, capabilities, parser observations.</h3><p>The graph is sourced from the connected PRISM backend. A clean early PASS may need explicit deterministic interpretation before a graph exists.</p></div><div className="hero-actions"><button className="secondary" disabled={!remoteId} onClick={onRefresh}><RefreshCw size={15}/> Refresh graph</button><button className="primary" disabled={!remoteId} onClick={onGenerate}><Network size={15}/> Run interpretation and build graph</button></div></div><JsonGraph body={body} error={error} loading={loading} /></div>}
 function LabView({body,error,loading,remoteId,onStart}:{body:JsonValue|null;error?:string;loading?:boolean;remoteId:string|null;onStart:()=>void}){return <div className="page-stack"><div className="hero-grid compact"><div className="hero-copy"><div className="section-label">PRISM LAB</div><h2>Evidence-grounded investigation.</h2><p>The Lab is where retrieval, reasoning, semantic experiments, validation and minimization belong. The client only displays what the connected backend returns.</p><button className="primary" disabled={!remoteId} onClick={onStart}><BrainCircuit size={16}/> Start / refresh investigation</button></div><div className="hero-evidence"><div className="section-label">CONNECTED ARTIFACT</div><strong className="mono big-code">{remoteId||'none'}</strong></div></div><JsonPanel body={body} error={error} loading={loading} empty="Connect an artifact to enter PRISM Lab." /></div>}
 function ExperimentView({body,error,loading,remoteId,onRefresh}:{body:JsonValue|null;error?:string;loading?:boolean;remoteId:string|null;onRefresh:()=>void}){return <div className="page-stack"><div className="action-banner"><div><div className="section-label">EXPERIMENTS / INVESTIGATION STATE</div><h3>Controlled experiments and investigation state.</h3><p>This view displays backend investigation data when the current API exposes it. No experiment results are fabricated locally.</p></div><button className="secondary" disabled={!remoteId} onClick={onRefresh}><RefreshCw size={15}/> Refresh</button></div><JsonPanel body={body} error={error} loading={loading} empty="No investigation data loaded." /></div>}
 function EvidenceView({selected,body,error,loading,remoteId,onRefresh}:{selected:ScanResult|null;body:JsonValue|null;error?:string;loading?:boolean;remoteId:string|null;onRefresh:()=>void}){return <div className="page-stack"><div className="two-col"><div className="panel"><PanelTitle label="LOCAL FASTSCAN" title="Native evidence"/>{selected?<div className="evidence-grid"><Evidence label="Name" value={selected.name}/><Evidence label="Claimed" value={selected.declared_type}/><Evidence label="Observed" value={selected.detected_type}/><Evidence label="Entropy" value={selected.entropy.toFixed(2)}/><Evidence label="SHA-256" value={selected.sha256} mono/><Evidence label="Risk" value={`${selected.risk_score}/100`}/></div>:<Empty icon={FileSearch} title="No local artifact selected" body="Scan a file first."/>}</div><div className="panel"><PanelTitle label="BACKEND EVIDENCE" title="FastScan record"/><button className="secondary small" disabled={!remoteId} onClick={onRefresh}><RefreshCw size={14}/> Refresh backend evidence</button><JsonPanel body={body} error={error} loading={loading} empty="No backend FastScan loaded." embedded/></div></div></div>}
@@ -337,7 +390,7 @@ function SettingsView({apiUrl,quarantineDir,onSave}:{apiUrl:string;quarantineDir
 function JsonPanel({body,error,loading,empty,embedded=false}:{body:JsonValue|null;error?:string;loading?:boolean;empty:string;embedded?:boolean}){return <div className={embedded?'json-panel embedded':'panel json-wrap'}>{loading?<div className="loading"><RefreshCw size={17} className="spin"/> Loading backend evidence…</div>:error?<div className="error"><CircleAlert size={17}/><div><strong>Backend request failed</strong><span>{error}</span></div></div>:body===null?<div className="empty mini"><Code2 size={18}/><h3>{empty}</h3></div>:<JsonPreview body={body} empty={empty}/>}</div>}
 function JsonPreview({body,empty}:{body:JsonValue|null;empty:string}){if(body===null)return <div className="empty mini"><Code2 size={18}/><h3>{empty}</h3></div>;return <pre className="json-pre">{JSON.stringify(body,null,2)}</pre>}
 function JsonGraph({body,error,loading}:{body:JsonValue|null;error?:string;loading?:boolean}){return <div className="graph-panel">{loading?<div className="loading"><RefreshCw size={17} className="spin"/> Loading graph evidence…</div>:error?<div className="error"><CircleAlert size={17}/><div><strong>Graph unavailable</strong><span>{error}</span></div></div>:body===null?<div className="empty mini"><Network size={20}/><h3>No graph loaded</h3><p>Connect an artifact and request graph evidence.</p></div>:<GraphFromJson body={body}/>}</div>}
-function GraphFromJson({body}:{body:JsonValue}){const obj=isObject(body)?body:null;const nodes=Array.isArray(obj?.nodes)?obj.nodes:[];const edges=Array.isArray(obj?.edges)?obj.edges:[];if(!nodes.length&&Array.isArray(body)) return <pre className="json-pre">{JSON.stringify(body,null,2)}</pre>;return <div className="graph-canvas"><div className="graph-note"><Network size={15}/> {nodes.length} nodes · {edges.length} relationships from backend</div><div className="graph-nodes">{nodes.map((node:any,i:number)=><div className="graph-node" key={i}><div className="node-kind">{String(node.kind??node.type??'node')}</div><strong>{String(node.label??node.name??node.id??`Node ${i+1}`)}</strong><span>{String(node.description??node.identity??'')}</span></div>)}</div>{edges.length>0&&<div className="edge-list">{edges.slice(0,80).map((edge:any,i:number)=><div key={i}><span>{String(edge.source??edge.from??'?')}</span><ArrowRight size={13}/><span>{String(edge.target??edge.to??'?')}</span><em>{String(edge.label??edge.relation??'relates')}</em></div>)}</div>}</div>}
+function GraphFromJson({body}:{body:JsonValue}){const obj=isObject(body)?body:null;const nodes=Array.isArray(obj?.nodes)?obj.nodes:[];const edges=Array.isArray(obj?.edges)?obj.edges:[];if(!nodes.length&&Array.isArray(body)) return <pre className="json-pre">{JSON.stringify(body,null,2)}</pre>;return <div className="graph-canvas"><div className="graph-note"><Network size={15}/> {nodes.length} nodes · {edges.length} relationships from backend</div><div className="graph-nodes">{nodes.map((node:any,i:number)=><div className="graph-node" key={i}><div className="node-kind">{String(node.kind??node.type??'node')}</div><strong>{String(node.label??node.name??node.id??`Node ${i+1}`)}</strong><span>{String(node.description??node.identity??'')}</span></div>)}</div>{edges.length>0&&<div className="edge-list">{edges.slice(0,80).map((edge:any,i:number)=><div key={i}><span>{String(edge.source??edge.from??'?')}</span><ArrowRight size={13}/><span>{String(edge.target??edge.to??'?')}</span><em>{String(edge.type??edge.label??edge.relation??'relates')}</em></div>)}</div>}</div>}
 
 function Empty({icon:Icon,title,body,action,actionLabel}:{icon:any;title:string;body:string;action?:()=>void;actionLabel?:string}){return <div className="empty"><div className="empty-icon"><Icon size={21}/></div><h3>{title}</h3><p>{body}</p>{action&&actionLabel&&<button className="secondary" onClick={action}>{actionLabel}</button>}</div>}
 

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prism-local-runtime"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.scripts]
+prism = "app.local_runtime:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

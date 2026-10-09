@@ -14,6 +14,7 @@ from app.schemas.fastscan import (
     ObservedIdentity,
     Statistics,
 )
+from app.services.fastscan_structural import scan_structure_and_security
 
 
 IDENTITIES = {
@@ -37,21 +38,36 @@ EXTENSION_TYPES = {
 }
 
 
+PDF_HEADER_SEARCH_BYTES = 1024
+
+
 def detect_type(header: bytes) -> str:
-    if header.startswith(b"%PDF-"):
+    # Acrobat-compatible PDF recovery:
+    # real-world PDF consumers may accept %PDF- anywhere within
+    # the first 1024 bytes rather than requiring byte offset zero.
+    if b"%PDF-" in header[:PDF_HEADER_SEARCH_BYTES]:
         return "PDF"
+
     if header.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
         return "ZIP"
+
     if header.startswith(b"\x89PNG\r\n\x1a\n"):
         return "PNG"
+
     if header.startswith(b"\xff\xd8\xff"):
         return "JPEG"
+
     if header.startswith(b"\x7fELF"):
         return "ELF"
+
     if header.startswith(b"MZ") and len(header) >= 64:
         pe_offset = int.from_bytes(header[60:64], "little")
-        if pe_offset <= len(header) - 4 and header[pe_offset:pe_offset + 4] == b"PE\0\0":
+        if (
+            pe_offset <= len(header) - 4
+            and header[pe_offset:pe_offset + 4] == b"PE\0\0"
+        ):
             return "PE"
+
     return "UNKNOWN"
 
 
@@ -80,10 +96,22 @@ class FastScanService:
         detected_type = detect_type(header)
         mime, description = IDENTITIES[detected_type]
         expected_type = EXTENSION_TYPES.get(artifact.claimed_extension.lower())
-        matches = None if detected_type == "UNKNOWN" or expected_type is None else expected_type == detected_type
+        matches = None if detected_type == "UNKNOWN" or not artifact.claimed_extension else expected_type == detected_type
         entropy = -sum((n / size) * math.log2(n / size) for n in counts.values()) if size else 0.0
         hash_matches = digest.hexdigest() == artifact.sha256
         signals = []
+
+        pdf_header_offset = header[:PDF_HEADER_SEARCH_BYTES].find(b"%PDF-")
+        if detected_type == "PDF" and pdf_header_offset > 0:
+            signals.append(FastScanSignal(
+                code="PDF_HEADER_NOT_AT_BYTE_ZERO",
+                severity="WARNING",
+                message=(
+                    "PDF header was recovered within the first 1024 bytes "
+                    "but did not begin at byte zero."
+                ),
+            ))
+
         if detected_type == "UNKNOWN":
             signals.append(FastScanSignal(
                 code="UNKNOWN_FILE_TYPE", severity="INFO",
@@ -100,6 +128,7 @@ class FastScanService:
                 message="Stored artifact SHA-256 differs from the ingestion hash.",
             ))
 
+        structural, security_precursors = scan_structure_and_security(path, size, detected_type)
         result = FastScanResult(
             artifact_id=artifact.artifact_id,
             sha256=digest.hexdigest(),
@@ -111,6 +140,8 @@ class FastScanService:
             header=HeaderEvidence(first_bytes_hex=header[:32].hex()),
             integrity=IntegrityEvidence(sha256_matches_ingestion=hash_matches),
             signals=signals,
+            structural_features=structural,
+            pretriage_security_features=security_precursors,
         )
         self._results[artifact.artifact_id] = result
         return result

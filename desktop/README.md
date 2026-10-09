@@ -28,9 +28,8 @@ It combines the investigation surfaces of the PRISM web application with native 
 - Monitor selected directories recursively.
 - Re-scan created/modified files from watched directories.
 - Persist local scan history.
-- Quarantine a file into the application data directory.
-- Inspect quarantine evidence, score, SHA-256, original path, and isolated path.
-- Restore/unquarantine a file without overwriting an existing filename.
+- View authenticated, encrypted Sentinel quarantine records from the local PRISM backend and restore by quarantine ID.
+- Recover legacy desktop quarantine records created by older builds; new local scans do not create these unencrypted records.
 - Reveal files in Windows Explorer.
 - Hand off a locally inspected artifact to the PRISM FastAPI backend.
 
@@ -80,7 +79,7 @@ http://127.0.0.1:8000
 
 Change it in **Settings → PRISM API endpoint**.
 
-Local scanning, history, watching, and quarantine work without the backend. Backend-dependent investigation screens request live data from the configured API and display an error/empty state if that endpoint or route is unavailable.
+Local scanning, history, and review-only watching work without the backend. Encrypted quarantine and deterministic investigation require the local backend. Backend watch roots are configured separately with `prism watch add`. The desktop accepts only a loopback HTTP backend endpoint.
 
 ## Safety model
 

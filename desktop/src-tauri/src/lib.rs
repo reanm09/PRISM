@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -440,57 +440,6 @@ fn get_quarantine(state: State<'_, AppState>) -> Result<Vec<QuarantineItem>, Str
     Ok(state.quarantined.lock().map_err(|_| "state lock failed")?.clone())
 }
 
-fn unique_quarantine_destination(q: &Path, name: &str, sha256: &str) -> PathBuf {
-    let safe_name: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect();
-    let short = &sha256[..12.min(sha256.len())];
-    q.join(format!("{short}__{safe_name}.quarantined"))
-}
-
-#[tauri::command]
-fn quarantine_file(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<QuarantineItem, String> {
-    let result = scan_path_internal(&app, state.inner(), &path)?;
-    let src = PathBuf::from(&path);
-    let (_, q) = app_dirs(&app)?;
-    let q_norm = q.to_string_lossy().to_lowercase();
-    if src.to_string_lossy().to_lowercase().starts_with(&q_norm) {
-        return Err("Artifact is already inside Sentinel quarantine.".into());
-    }
-    if !src.is_file() { return Err("Artifact does not exist.".into()); }
-    let dest = unique_quarantine_destination(&q, &result.name, &result.sha256);
-    fs::rename(&src, &dest)
-        .or_else(|_| { fs::copy(&src, &dest).map(|_| ()).and_then(|_| fs::remove_file(&src)) })
-        .map_err(|e| e.to_string())?;
-    let item = QuarantineItem {
-        id: result.sha256.clone(),
-        name: result.name.clone(),
-        original_path: result.path.clone(),
-        quarantined_path: dest.to_string_lossy().to_string(),
-        sha256: result.sha256.clone(),
-        risk_score: result.risk_score,
-        risk_factors: result.risk_factors.clone(),
-        declared_type: result.declared_type.clone(),
-        detected_type: result.detected_type.clone(),
-        size_bytes: result.size_bytes,
-        quarantined_at: now_isoish(),
-        scan_status: result.status.clone(),
-    };
-    {
-        let mut list = state.quarantined.lock().map_err(|_| "state lock failed")?;
-        list.retain(|x| x.id != item.id);
-        list.insert(0, item.clone());
-    }
-    {
-        let mut hist = state.history.lock().map_err(|_| "state lock failed")?;
-        for h in hist.iter_mut() {
-            if h.result.sha256 == item.sha256 { h.result.status = "QUARANTINED".into(); }
-        }
-    }
-    persist_history(&app, state.inner())?;
-    persist_quarantine(&app, state.inner())?;
-    let _ = app.emit("sentinel://quarantine-changed", item.clone());
-    Ok(item)
-}
-
 #[tauri::command]
 fn restore_quarantine(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<String, String> {
     let item = {
@@ -553,6 +502,16 @@ fn open_quarantine_folder(app: AppHandle) -> Result<String, String> {
     Ok(q.to_string_lossy().to_string())
 }
 
+fn local_api_base(api_url: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(api_url.trim()).map_err(|e| e.to_string())?;
+    if url.scheme() != "http" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+        || url.username() != "" || url.password().is_some() || url.path() != "/"
+        || url.query().is_some() || url.fragment().is_some() {
+        return Err("PRISM backend endpoint must be a loopback HTTP origin".into());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
 #[tauri::command]
 async fn backend_request(
     api_url: String,
@@ -561,8 +520,11 @@ async fn backend_request(
     body: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let method = method.parse::<reqwest::Method>().map_err(|e| e.to_string())?;
-    let client = reqwest::Client::new();
-    let url = format!("{}{}", api_url.trim_end_matches('/'), path);
+    if !(path == "/health" || path.starts_with("/api/")) || path.starts_with("//") {
+        return Err("Unsupported backend path".into());
+    }
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
+    let url = format!("{}{}", local_api_base(&api_url)?, path);
     let mut request = client.request(method, url);
     if let Some(raw) = body {
         let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -586,14 +548,19 @@ async fn backend_request(
 #[tauri::command]
 async fn handoff_artifact(path: String, api_url: String) -> Result<serde_json::Value, String> {
     let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let name = Path::new(&path).file_name().and_then(|x| x.to_str()).unwrap_or("artifact").to_string();
     let part = Part::bytes(bytes).file_name(name);
     let form = Form::new().part("file", part);
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/artifacts", api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
+    let url = format!("{}/api/artifacts", local_api_base(&api_url)?);
     let response = client.post(url).multipart(form).send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() { return Err(format!("Artifact upload failed: HTTP {}", response.status().as_u16())); }
     let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    let id = value.get("id").or_else(|| value.get("artifact_id")).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let id = value.get("artifact_id").and_then(|v| v.as_str()).ok_or("Artifact upload returned no artifact ID")?;
+    if value.get("sha256").and_then(|v| v.as_str()) != Some(sha256.as_str()) {
+        return Err("Uploaded artifact SHA-256 does not match local bytes".into());
+    }
     Ok(serde_json::json!({"artifact_id": id, "message": "Artifact uploaded to PRISM."}))
 }
 
@@ -608,7 +575,7 @@ fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, 
 
 #[tauri::command]
 fn set_api_url(state: State<'_, AppState>, api_url: String) -> Result<(), String> {
-    state.settings.lock().map_err(|_| "state lock failed")?.api_url = api_url.trim().trim_end_matches('/').to_string();
+    state.settings.lock().map_err(|_| "state lock failed")?.api_url = local_api_base(&api_url)?;
     Ok(())
 }
 
@@ -638,7 +605,6 @@ pub fn run() {
             add_watch,
             remove_watch,
             get_quarantine,
-            quarantine_file,
             restore_quarantine,
             reveal_file,
             open_quarantine_folder,

@@ -46,11 +46,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     if (!client) return;
 
     let active = true;
-    void client.auth.getUser().then(({ data }) => {
+    void client.auth.getUser().then(({ data }: { data: { user: { email?: string } | null } }) => {
       if (active) setAccountEmail(data.user?.email ?? null);
     });
 
-    const { data: subscription } = client.auth.onAuthStateChange((_event, session) => {
+    const { data: subscription } = client.auth.onAuthStateChange((_event: string, session: { user: { email?: string } } | null) => {
       setAccountEmail(session?.user?.email ?? null);
     });
 
